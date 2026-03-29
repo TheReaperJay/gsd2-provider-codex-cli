@@ -16,6 +16,7 @@ import type {
   GsdStreamContext,
   GsdProviderDeps,
   GsdUsage,
+  GsdToolResultPayload,
   CliCheckResult,
 } from "@thereaperjay/gsd-provider-api";
 
@@ -141,6 +142,24 @@ function trimDetail(text: string, max = 100): string {
   const single = text.replace(/\s+/g, " ").trim();
   if (single.length <= max) return single;
   return `${single.slice(0, max - 1)}...`;
+}
+
+function safeJson(value: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "{}";
+  }
+}
+
+function buildCommandToolResult(aggregatedOutput: string, exitCode: number | null): GsdToolResultPayload {
+  const fallback = exitCode !== null && exitCode !== 0 ? `(command failed with exit code ${exitCode})` : "";
+  const text = aggregatedOutput.length > 0 ? aggregatedOutput : fallback;
+  return {
+    content: text.length > 0 ? [{ type: "text", text }] : [],
+    isError: exitCode !== null && exitCode !== 0,
+    details: { exitCode },
+  };
 }
 
 function isToolLikeItemType(itemType: string): boolean {
@@ -336,7 +355,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
     function closeOutstandingTools(): void {
       for (const toolCallId of activeToolCalls) {
         deps.onToolEnd(toolCallId);
-        queue.push({ type: "tool_end", toolCallId });
+        queue.push({ type: "tool_call_end", toolCallId });
       }
       activeToolCalls.clear();
     }
@@ -398,11 +417,12 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       deps.onToolStart(toolCallId);
       activityWriter.processToolStart(toolCallId, command);
       queue.push({
-        type: "tool_start",
+        type: "tool_call_start",
         toolCallId,
         toolName: "Bash",
         detail: trimDetail(command),
       });
+      queue.push({ type: "tool_call_delta", toolCallId, delta: safeJson({ command }) });
     }
 
     function startGenericToolCall(item: Record<string, unknown>): void {
@@ -415,12 +435,23 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
 
       activeToolCalls.add(toolCallId);
       deps.onToolStart(toolCallId);
+      const toolName = buildGenericToolName(itemType, item);
+      const detail = buildGenericToolDetail(item);
       queue.push({
-        type: "tool_start",
+        type: "tool_call_start",
         toolCallId,
-        toolName: buildGenericToolName(itemType, item),
-        detail: buildGenericToolDetail(item),
+        toolName,
+        detail,
       });
+      const genericArgs: Record<string, unknown> = {};
+      const command = asString(item.command).trim();
+      const name = asString(item.name).trim();
+      if (command.length > 0) genericArgs.command = command;
+      if (name.length > 0) genericArgs.name = name;
+      if (detail) genericArgs.detail = detail;
+      if (Object.keys(genericArgs).length > 0) {
+        queue.push({ type: "tool_call_delta", toolCallId, delta: safeJson(genericArgs) });
+      }
     }
 
     function endToolCall(item: Record<string, unknown>): void {
@@ -438,7 +469,13 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
         activeToolCalls.delete(toolCallId);
         deps.onToolEnd(toolCallId);
         activityWriter.processToolResult(toolCallId, aggregatedOutput, exitCode);
-        queue.push({ type: "tool_end", toolCallId });
+        queue.push({ type: "tool_call_end", toolCallId });
+        queue.push({
+          type: "tool_result",
+          toolCallId,
+          toolName: "Bash",
+          result: buildCommandToolResult(aggregatedOutput, exitCode),
+        });
       }
     }
 
@@ -448,13 +485,25 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       if (itemType === "command_execution") return;
 
       const toolCallId = makeToolCallId(asString(item.id));
+      const toolName = buildGenericToolName(itemType, item);
       if (!activeToolCalls.has(toolCallId)) {
         startGenericToolCall(item);
       }
       if (activeToolCalls.has(toolCallId)) {
         activeToolCalls.delete(toolCallId);
         deps.onToolEnd(toolCallId);
-        queue.push({ type: "tool_end", toolCallId });
+        queue.push({ type: "tool_call_end", toolCallId });
+        const outputText = asString(item.text).trim() || asString(item.message).trim();
+        queue.push({
+          type: "tool_result",
+          toolCallId,
+          toolName,
+          result: {
+            content: outputText.length > 0 ? [{ type: "text", text: outputText }] : [],
+            isError: false,
+            details: { itemType },
+          },
+        });
       }
     }
 

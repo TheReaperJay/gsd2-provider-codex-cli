@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
-    "@thereaperjay/gsd-provider-api": "^0.5.8",
+    "@thereaperjay/gsd-provider-api": "file:../gsd-provider-api",
     "zod": "^3.25.76",
     "zod-to-json-schema": "^3.25.0"
   }
