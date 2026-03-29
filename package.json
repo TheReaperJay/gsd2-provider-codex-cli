@@ -1,0 +1,17 @@
+{
+  "name": "gsd-provider-codex-cli",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ]
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@thereaperjay/gsd-provider-api": "^0.5.8",
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.25.0"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "codex-reaper",
+  "name": "Codex CLI Provider",
+  "version": "1.0.0",
+  "description": "Access Codex models through local Codex CLI authentication",
+  "tier": "community",
+  "requires": { "platform": ">=2.44.0" },
+  "provides": {
+    "provider": {
+      "id": "codex-reaper",
+      "authType": "cli",
+      "defaultModel": "codex-reaper:gpt-5.4-mini"
+    }
+  },
+  "dependencies": {
+    "runtime": ["codex"]
+  }
+}
