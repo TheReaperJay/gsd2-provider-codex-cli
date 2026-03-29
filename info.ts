@@ -280,15 +280,6 @@ function resolveActivityDir(basePath: string): string {
   return join(basePath, ".gsd", "activity");
 }
 
-function summarizeCommandResult(command: string, output: string, exitCode: number | null): string {
-  const normalizedCommand = command.replace(/\s+/g, " ").trim();
-  const normalizedOutput = output.replace(/\u0000/g, "").trim();
-  const snippet = normalizedOutput.length > 700 ? `${normalizedOutput.slice(0, 699)}...` : normalizedOutput;
-  const lines = [`$ ${normalizedCommand || "<command>"}`, `exit_code: ${exitCode === null ? "unknown" : String(exitCode)}`];
-  if (snippet.length > 0) lines.push(snippet);
-  return `${lines.join("\n")}\n`;
-}
-
 function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps): AsyncIterable<GsdEvent> {
   const queue = createEventQueue();
 
@@ -321,6 +312,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
     let errorEmitted = false;
     let terminalReason: "none" | "cancel" | "soft_timeout" | "idle_timeout" | "hard_timeout" = "none";
     let lastCodexError: string | null = null;
+    const bufferedAgentMessages: string[] = [];
 
     const activeToolCalls = new Set<string>();
 
@@ -436,7 +428,6 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       if (itemType !== "command_execution") return;
 
       const toolCallId = makeToolCallId(asString(item.id));
-      const command = asString(item.command);
       const aggregatedOutput = asString(item.aggregated_output);
       const exitCodeRaw = item.exit_code;
       const exitCode = typeof exitCodeRaw === "number" && Number.isFinite(exitCodeRaw) ? exitCodeRaw : null;
@@ -447,7 +438,6 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
         activeToolCalls.delete(toolCallId);
         deps.onToolEnd(toolCallId);
         activityWriter.processToolResult(toolCallId, aggregatedOutput, exitCode);
-        queue.push({ type: "text_delta", text: summarizeCommandResult(command, aggregatedOutput, exitCode) });
         queue.push({ type: "tool_end", toolCallId });
       }
     }
@@ -465,6 +455,26 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
         activeToolCalls.delete(toolCallId);
         deps.onToolEnd(toolCallId);
         queue.push({ type: "tool_end", toolCallId });
+      }
+    }
+
+    function flushBufferedAgentMessages(finalAsText: boolean): void {
+      if (bufferedAgentMessages.length === 0) return;
+
+      const all = bufferedAgentMessages.splice(0, bufferedAgentMessages.length);
+      const final = all.pop();
+
+      for (const interim of all) {
+        const trimmed = interim.trim();
+        if (!trimmed) continue;
+        queue.push({ type: "thinking_delta", thinking: `${trimmed}\n` });
+      }
+
+      if (final) {
+        const trimmed = final.trim();
+        if (!trimmed) return;
+        if (finalAsText) queue.push({ type: "text_delta", text: `${trimmed}\n` });
+        else queue.push({ type: "thinking_delta", thinking: `${trimmed}\n` });
       }
     }
 
@@ -494,7 +504,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
           const text = asString(item.text).trim();
           if (text.length > 0) {
             activityWriter.processAssistantText(text);
-            queue.push({ type: "text_delta", text: `${text}\n` });
+            bufferedAgentMessages.push(text);
           }
           return;
         }
@@ -521,6 +531,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       }
 
       if (type === "turn.completed") {
+        flushBufferedAgentMessages(true);
         const usage = normalizeUsage(event.usage);
         activityWriter.processUsage(usage);
         emitCompletion(usage, "stop");
@@ -528,6 +539,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       }
 
       if (type === "turn.failed") {
+        flushBufferedAgentMessages(false);
         const failedMessage = asString(toRecord(event.error).message) || lastCodexError || "Codex turn failed";
         emitError(failedMessage);
         return;
@@ -641,6 +653,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       }
 
       if (!completionEmitted && !errorEmitted) {
+        flushBufferedAgentMessages(true);
         if (terminalReason === "cancel") {
           emitCompletion({ inputTokens: 0, outputTokens: 0 }, "cancel");
         } else if (terminalReason === "soft_timeout") {

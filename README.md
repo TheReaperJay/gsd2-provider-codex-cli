@@ -7,7 +7,6 @@
 - Registers provider `codex-reaper` with model IDs in `codex-reaper:*` namespace
 - Uses `codex exec --json` for request execution (CLI-authenticated runtime)
 - Translates Codex JSONL events into GSD provider events (`text_delta`, `tool_start`, `tool_end`, `completion`, `error`)
-- Emits command completion summaries (command, exit code, output snippet) from `command_execution` results
 - Injects GSD tool registry into Codex per-run through a local Streamable HTTP MCP bridge (`mcp_servers.gsd_tools.url=...`)
 - Runs onboarding/readiness checks via `codex --version` and `codex login status`
 - Enforces soft/idle/hard timeout handling from supervisor config
@@ -23,6 +22,8 @@ This provider treats Codex tool-like item events as tool activity:
 - other non-message item types -> generic `tool_start`/`tool_end`
 
 Tool details are derived from the command string and surfaced to GSD status UI.
+
+To keep tool output cleanly separated from assistant chat content, command/tool result payloads are not forwarded as `text_delta`.
 
 ## Token / Usage Mapping
 
