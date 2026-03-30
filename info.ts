@@ -3,7 +3,8 @@
  */
 
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { registerProviderInfo } from "@thereaperjay/gsd-provider-api";
@@ -27,6 +28,68 @@ const CODEX_MODEL_ALIASES: Record<string, string> = {
   "codex-reaper:gpt-5.3-codex-spark": "gpt-5.3-codex-spark",
   "codex-reaper:gpt-5.2-codex": "gpt-5.2-codex",
 };
+
+const CODEX_PLAN_LABELS: Record<string, string> = {
+  free: "Codex Free",
+  plus: "Codex Plus",
+  pro: "Codex Pro",
+  team: "Codex Team",
+  enterprise: "Codex Enterprise",
+  max: "Codex Max",
+};
+
+function toTitleCaseWords(value: string): string {
+  return value
+    .split(/[\s_-]+/g)
+    .filter(part => part.length > 0)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function mapCodexPlanLabel(rawPlanType: string): string | undefined {
+  const normalized = rawPlanType.trim().toLowerCase();
+  if (normalized.length === 0) return undefined;
+
+  const compact = normalized.replace(/^chatgpt[\s_-]*/, "");
+  if (CODEX_PLAN_LABELS[compact]) return CODEX_PLAN_LABELS[compact];
+
+  const pretty = toTitleCaseWords(compact);
+  if (pretty.length === 0) return undefined;
+  return "Codex " + pretty;
+}
+
+function readCodexAuthMetadata(): { email?: string; subscriptionLabel?: string } {
+  try {
+    const configuredHome = process.env.CODEX_HOME?.trim() ?? "";
+    const authPath = configuredHome.length > 0
+      ? join(configuredHome, "auth.json")
+      : join(homedir(), ".codex", "auth.json");
+
+    if (!existsSync(authPath)) return {};
+
+    const auth = toRecord(JSON.parse(readFileSync(authPath, "utf-8")));
+    const tokens = toRecord(auth.tokens);
+    const idToken = asString(tokens.id_token).trim();
+    if (idToken.length === 0) return {};
+
+    const segments = idToken.split(".");
+    if (segments.length < 2) return {};
+
+    const payload = toRecord(JSON.parse(Buffer.from(segments[1], "base64url").toString("utf-8")));
+    const email = asString(payload.email).trim();
+
+    const authClaims = toRecord(payload["https://api.openai.com/auth"]);
+    const rawPlanType = asString(authClaims.chatgpt_plan_type || payload.chatgpt_plan_type).trim();
+    const subscriptionLabel = mapCodexPlanLabel(rawPlanType);
+
+    return {
+      ...(email.length > 0 ? { email } : {}),
+      ...(subscriptionLabel ? { subscriptionLabel } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
 
 function checkCodexCli(spawnFn: typeof spawnSync = spawnSync): CliCheckResult {
   const versionResult = spawnFn("codex", ["--version"], { encoding: "utf-8" });
@@ -57,7 +120,33 @@ function checkCodexCli(spawnFn: typeof spawnSync = spawnSync): CliCheckResult {
   }
 
   const displayInfo = (authResult.stdout ?? "").trim();
-  return displayInfo.length > 0 ? { ok: true, displayInfo } : { ok: true };
+  const metadata = readCodexAuthMetadata();
+
+  return {
+    ok: true,
+    ...(displayInfo.length > 0 ? { displayInfo } : {}),
+    ...(metadata.email ? { email: metadata.email } : {}),
+    ...(metadata.subscriptionLabel ? { subscriptionLabel: metadata.subscriptionLabel } : {}),
+  };
+}
+
+function formatCliAuthenticatedSummary(displayName: string, result: Extract<CliCheckResult, { ok: true }>): string {
+  const email = typeof result.email === "string" ? result.email.trim() : "";
+  const subscriptionLabel = typeof result.subscriptionLabel === "string" ? result.subscriptionLabel.trim() : "";
+
+  if (email.length > 0 && subscriptionLabel.length > 0) {
+    return displayName + " authenticated as " + email + " (" + subscriptionLabel + ")";
+  }
+
+  if (email.length > 0) {
+    return displayName + " authenticated as " + email;
+  }
+
+  if (subscriptionLabel.length > 0) {
+    return displayName + " authenticated (" + subscriptionLabel + ")";
+  }
+
+  return displayName + " authenticated";
 }
 
 function resolveCodexModel(modelId: string): string {
@@ -796,16 +885,12 @@ export const codexProviderInfo: GsdProviderInfo = {
   isReady: () => checkCodexCli().ok,
   afterInstall: (ctx) => {
     const result = checkCodexCli();
-    if (!result.ok) {
+    if (result.ok === false) {
       ctx.warn(result.instruction);
       return;
     }
 
-    if (result.displayInfo) {
-      ctx.log(result.displayInfo);
-    } else {
-      ctx.log("Codex CLI authenticated");
-    }
+    ctx.log(formatCliAuthenticatedSummary("Codex CLI", result));
   },
   models: codexModels,
   createStream: codexCliCreateStream,
