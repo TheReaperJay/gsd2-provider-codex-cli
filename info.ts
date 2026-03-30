@@ -637,6 +637,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       if (!normalized) return;
       const chunk = normalized.endsWith("\n") ? normalized : `${normalized}\n`;
       queue.push({ type: "thinking_delta", thinking: chunk });
+      queue.push({ type: "thinking_end" });
     }
 
     function flushPendingAgentMessage(finalAsText: boolean): void {
