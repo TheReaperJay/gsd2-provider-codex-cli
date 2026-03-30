@@ -632,20 +632,27 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       }
     }
 
+    function pushThinkingText(text: string): void {
+      const normalized = text.trim();
+      if (!normalized) return;
+      const chunk = normalized.endsWith("\n") ? normalized : `${normalized}\n`;
+      queue.push({ type: "thinking_delta", thinking: chunk });
+    }
+
     function flushPendingAgentMessage(finalAsText: boolean): void {
       if (!pendingAgentMessage) return;
       const trimmed = pendingAgentMessage.trim();
       pendingAgentMessage = null;
       if (!trimmed) return;
       if (finalAsText) queue.push({ type: "text_delta", text: `${trimmed}\n` });
-      else queue.push({ type: "progress_delta", text: trimmed });
+      else pushThinkingText(trimmed);
     }
 
     function onAgentMessage(text: string): void {
       if (pendingAgentMessage) {
         const interim = pendingAgentMessage.trim();
         if (interim.length > 0) {
-          queue.push({ type: "progress_delta", text: interim });
+          pushThinkingText(interim);
         }
       }
       pendingAgentMessage = text;
@@ -687,7 +694,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
         if (itemType.includes("reason") || itemType.includes("thinking")) {
           const thought = asString(item.text).trim();
           if (thought.length > 0) {
-            queue.push({ type: "progress_delta", text: thought });
+            pushThinkingText(thought);
           }
           return;
         }
@@ -828,7 +835,8 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       }
 
       if (!completionEmitted && !errorEmitted) {
-        flushPendingAgentMessage(true);
+        const exitedCleanly = terminalReason === null && (exitResult.code ?? 0) === 0 && exitResult.signal === null;
+        flushPendingAgentMessage(exitedCleanly);
         if (terminalReason === "cancel") {
           emitCompletion({ inputTokens: 0, outputTokens: 0 }, "cancel");
         } else if (terminalReason === "soft_timeout") {
