@@ -252,6 +252,24 @@ function isTransientCodexError(message: string): boolean {
   return false;
 }
 
+function sanitizeAgentMessage(raw: string): string {
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .filter((line) => {
+      const lower = line.toLowerCase();
+      if (lower === "[compaction]") return false;
+      if (/^compacted from [\d,]+ tokens\b/i.test(line)) return false;
+      if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(line)) return false;
+      if (/^\$\s+\/bin\/bash\b/i.test(line)) return false;
+      if (/^exit_code:\s*-?\d+\b/i.test(line)) return false;
+      return true;
+    });
+
+  return lines.join("\n").trim();
+}
+
 function normalizeUsage(raw: unknown): GsdUsage {
   const usage = toRecord(raw);
   return {
@@ -331,7 +349,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
     let errorEmitted = false;
     let terminalReason: "none" | "cancel" | "soft_timeout" | "idle_timeout" | "hard_timeout" = "none";
     let lastCodexError: string | null = null;
-    const bufferedAgentMessages: string[] = [];
+    let pendingAgentMessage: string | null = null;
 
     const activeToolCalls = new Set<string>();
 
@@ -414,6 +432,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       }
 
       activeToolCalls.add(toolCallId);
+      flushPendingAgentMessage(false);
       deps.onToolStart(toolCallId);
       activityWriter.processToolStart(toolCallId, command);
       queue.push({
@@ -434,6 +453,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       if (activeToolCalls.has(toolCallId)) return;
 
       activeToolCalls.add(toolCallId);
+      flushPendingAgentMessage(false);
       deps.onToolStart(toolCallId);
       const toolName = buildGenericToolName(itemType, item);
       const detail = buildGenericToolDetail(item);
@@ -507,24 +527,23 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       }
     }
 
-    function flushBufferedAgentMessages(finalAsText: boolean): void {
-      if (bufferedAgentMessages.length === 0) return;
+    function flushPendingAgentMessage(finalAsText: boolean): void {
+      if (!pendingAgentMessage) return;
+      const trimmed = pendingAgentMessage.trim();
+      pendingAgentMessage = null;
+      if (!trimmed) return;
+      if (finalAsText) queue.push({ type: "text_delta", text: `${trimmed}\n` });
+      else queue.push({ type: "thinking_delta", thinking: `${trimmed}\n` });
+    }
 
-      const all = bufferedAgentMessages.splice(0, bufferedAgentMessages.length);
-      const final = all.pop();
-
-      for (const interim of all) {
-        const trimmed = interim.trim();
-        if (!trimmed) continue;
-        queue.push({ type: "thinking_delta", thinking: `${trimmed}\n` });
+    function onAgentMessage(text: string): void {
+      if (pendingAgentMessage) {
+        const interim = pendingAgentMessage.trim();
+        if (interim.length > 0) {
+          queue.push({ type: "thinking_delta", thinking: `${interim}\n` });
+        }
       }
-
-      if (final) {
-        const trimmed = final.trim();
-        if (!trimmed) return;
-        if (finalAsText) queue.push({ type: "text_delta", text: `${trimmed}\n` });
-        else queue.push({ type: "thinking_delta", thinking: `${trimmed}\n` });
-      }
+      pendingAgentMessage = text;
     }
 
     function handleJsonEvent(event: Record<string, unknown>): void {
@@ -550,10 +569,12 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
         }
 
         if (itemType === "agent_message") {
-          const text = asString(item.text).trim();
-          if (text.length > 0) {
+          const raw = asString(item.text).trim();
+          if (raw.length > 0) {
+            const text = sanitizeAgentMessage(raw);
+            if (text.length === 0) return;
             activityWriter.processAssistantText(text);
-            bufferedAgentMessages.push(text);
+            onAgentMessage(text);
           }
           return;
         }
@@ -580,7 +601,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       }
 
       if (type === "turn.completed") {
-        flushBufferedAgentMessages(true);
+        flushPendingAgentMessage(true);
         const usage = normalizeUsage(event.usage);
         activityWriter.processUsage(usage);
         emitCompletion(usage, "stop");
@@ -588,7 +609,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       }
 
       if (type === "turn.failed") {
-        flushBufferedAgentMessages(false);
+        flushPendingAgentMessage(false);
         const failedMessage = asString(toRecord(event.error).message) || lastCodexError || "Codex turn failed";
         emitError(failedMessage);
         return;
@@ -702,7 +723,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       }
 
       if (!completionEmitted && !errorEmitted) {
-        flushBufferedAgentMessages(true);
+        flushPendingAgentMessage(true);
         if (terminalReason === "cancel") {
           emitCompletion({ inputTokens: 0, outputTokens: 0 }, "cancel");
         } else if (terminalReason === "soft_timeout") {
