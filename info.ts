@@ -162,11 +162,20 @@ function buildCommandToolResult(aggregatedOutput: string, exitCode: number | nul
   };
 }
 
-function isToolLikeItemType(itemType: string): boolean {
+function isToolLikeItem(item: Record<string, unknown>): boolean {
+  const itemType = asString(item.type);
   if (!itemType) return false;
-  if (itemType === "agent_message" || itemType === "error") return false;
+  if (itemType === "agent_message" || itemType === "error" || itemType === "command_execution") return false;
   if (itemType.includes("reason") || itemType.includes("thinking")) return false;
-  return true;
+  if (itemType === "file_change") return false;
+
+  const command = asString(item.command).trim();
+  if (command.length > 0) return true;
+
+  const toolName = asString(item.tool_name).trim() || asString(item.name).trim();
+  if (toolName.length > 0) return true;
+
+  return /tool|mcp/i.test(itemType);
 }
 
 function buildGenericToolName(itemType: string, item: Record<string, unknown>): string {
@@ -252,22 +261,29 @@ function isTransientCodexError(message: string): boolean {
   return false;
 }
 
-function sanitizeAgentMessage(raw: string): string {
-  const lines = raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .filter((line) => {
-      const lower = line.toLowerCase();
-      if (lower === "[compaction]") return false;
-      if (/^compacted from [\d,]+ tokens\b/i.test(line)) return false;
-      if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(line)) return false;
-      if (/^\$\s+\/bin\/bash\b/i.test(line)) return false;
-      if (/^exit_code:\s*-?\d+\b/i.test(line)) return false;
-      return true;
-    });
+function isPoisonAgentLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  const lower = trimmed.toLowerCase();
+  if (lower === "[compaction]") return true;
+  if (/^compacted from [\d,]+ tokens\b/i.test(trimmed)) return true;
+  if (/ctrl\+\w+\s+to\s+expand/i.test(trimmed)) return true;
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(trimmed)) return true;
+  if (/^\$\s+\/bin\/bash\b/i.test(trimmed)) return true;
+  if (/^exit_code:\s*-?\d+\b/i.test(trimmed)) return true;
+  return false;
+}
 
-  return lines.join("\n").trim();
+function sanitizeAgentMessage(raw: string): string {
+  const kept = raw
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .filter((line) => !isPoisonAgentLine(line));
+
+  while (kept.length > 0 && kept[0]!.trim().length === 0) kept.shift();
+  while (kept.length > 0 && kept[kept.length - 1]!.trim().length === 0) kept.pop();
+
+  return kept.join("\n");
 }
 
 function normalizeUsage(raw: unknown): GsdUsage {
@@ -446,7 +462,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
 
     function startGenericToolCall(item: Record<string, unknown>): void {
       const itemType = asString(item.type);
-      if (!isToolLikeItemType(itemType)) return;
+      if (!isToolLikeItem(item)) return;
       if (itemType === "command_execution") return;
 
       const toolCallId = makeToolCallId(asString(item.id));
@@ -501,7 +517,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
 
     function endGenericToolCall(item: Record<string, unknown>): void {
       const itemType = asString(item.type);
-      if (!isToolLikeItemType(itemType)) return;
+      if (!isToolLikeItem(item)) return;
       if (itemType === "command_execution") return;
 
       const toolCallId = makeToolCallId(asString(item.id));
@@ -533,14 +549,14 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       pendingAgentMessage = null;
       if (!trimmed) return;
       if (finalAsText) queue.push({ type: "text_delta", text: `${trimmed}\n` });
-      else queue.push({ type: "thinking_delta", thinking: `${trimmed}\n` });
+      else queue.push({ type: "progress_delta", text: trimmed });
     }
 
     function onAgentMessage(text: string): void {
       if (pendingAgentMessage) {
         const interim = pendingAgentMessage.trim();
         if (interim.length > 0) {
-          queue.push({ type: "thinking_delta", thinking: `${interim}\n` });
+          queue.push({ type: "progress_delta", text: interim });
         }
       }
       pendingAgentMessage = text;
@@ -569,10 +585,10 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
         }
 
         if (itemType === "agent_message") {
-          const raw = asString(item.text).trim();
-          if (raw.length > 0) {
+          const raw = asString(item.text);
+          if (raw.trim().length > 0) {
             const text = sanitizeAgentMessage(raw);
-            if (text.length === 0) return;
+            if (text.trim().length === 0) return;
             activityWriter.processAssistantText(text);
             onAgentMessage(text);
           }
@@ -582,7 +598,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
         if (itemType.includes("reason") || itemType.includes("thinking")) {
           const thought = asString(item.text).trim();
           if (thought.length > 0) {
-            queue.push({ type: "thinking_delta", thinking: `${thought}\n` });
+            queue.push({ type: "progress_delta", text: thought });
           }
           return;
         }
