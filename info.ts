@@ -492,34 +492,20 @@ function buildMcpToolResult(
   };
 }
 
-function updateAppendOnlyPreview(
+function pushReplaceModeToolArgs(
   session: ActiveMcpToolSession,
-  nextPreview: string,
+  nextArgs: Record<string, unknown>,
   queue: EventQueue,
 ): void {
-  if (!nextPreview) return;
-  if (!session.previewStreamingEnabled) {
-    session.lastPreviewText = nextPreview;
-    return;
-  }
-
-  if (!session.lastPreviewText) {
-    session.lastPreviewText = nextPreview;
-    queue.push({ type: "tool_call_delta", toolCallId: session.toolCallId, delta: nextPreview });
-    return;
-  }
-
-  if (!nextPreview.startsWith(session.lastPreviewText)) {
-    session.previewStreamingEnabled = false;
-    session.lastPreviewText = nextPreview;
-    return;
-  }
-
-  const suffix = nextPreview.slice(session.lastPreviewText.length);
-  session.lastPreviewText = nextPreview;
-  if (suffix.length > 0) {
-    queue.push({ type: "tool_call_delta", toolCallId: session.toolCallId, delta: suffix });
-  }
+  const serializedArgs = safeJson(nextArgs);
+  if (serializedArgs === session.lastArgsJson) return;
+  session.lastArgsJson = serializedArgs;
+  queue.push({
+    type: "tool_call_delta",
+    toolCallId: session.toolCallId,
+    delta: serializedArgs,
+    mode: "replace",
+  } as GsdEvent);
 }
 
 interface ActiveMcpToolSession {
@@ -529,8 +515,7 @@ interface ActiveMcpToolSession {
   detail?: string;
   latestArgs: Record<string, unknown>;
   latestResult: GsdToolResultPayload | null;
-  lastPreviewText: string;
-  previewStreamingEnabled: boolean;
+  lastArgsJson: string;
   keepOpenAcrossCalls: boolean;
 }
 
@@ -776,8 +761,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
           detail,
           latestArgs,
           latestResult: null,
-          lastPreviewText: "",
-          previewStreamingEnabled: true,
+          lastArgsJson: "",
           keepOpenAcrossCalls,
         };
         activeToolCalls.add(toolCallId);
@@ -797,7 +781,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
         activityWriter.updateToolArguments(activeMcpSession.toolCallId, toolName, latestArgs);
       }
 
-      updateAppendOnlyPreview(activeMcpSession, buildMcpPreviewText(toolName, latestArgs), queue);
+      pushReplaceModeToolArgs(activeMcpSession, latestArgs, queue);
     }
 
     function handleBridgeToolResult(event: CodexBridgeToolResultEvent): void {
@@ -816,7 +800,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
 
       activeMcpSession.latestArgs = latestArgs;
       activityWriter.updateToolArguments(activeMcpSession.toolCallId, toolName, latestArgs);
-      updateAppendOnlyPreview(activeMcpSession, buildMcpPreviewText(toolName, latestArgs), queue);
+      pushReplaceModeToolArgs(activeMcpSession, latestArgs, queue);
 
       const result = buildMcpToolResult(toolName, latestArgs, event);
       activeMcpSession.latestResult = result;
