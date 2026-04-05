@@ -4,6 +4,7 @@
  * Writes JSONL activity entries compatible with GSD session forensics.
  */
 
+import type { GsdToolResultPayload } from "@thereaperjay/gsd-provider-api";
 import { closeSync, constants, mkdirSync, openSync, readdirSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
@@ -55,7 +56,7 @@ function cleanText(text: string): string {
 
 export class CodexActivityWriter {
   private readonly entries: unknown[] = [];
-  private readonly toolMap = new Map<string, string>();
+  private readonly toolMap = new Map<string, { name: string; arguments: Record<string, unknown> }>();
   private readonly metrics: CodexUnitMetrics = {
     inputTokens: 0,
     outputTokens: 0,
@@ -81,8 +82,11 @@ export class CodexActivityWriter {
     });
   }
 
-  processToolStart(toolCallId: string, command: string): void {
-    this.toolMap.set(toolCallId, command);
+  processToolStart(toolCallId: string, toolName: string, args: Record<string, unknown>): void {
+    this.toolMap.set(toolCallId, {
+      name: toolName,
+      arguments: { ...args },
+    });
     this.entries.push({
       type: "message",
       message: {
@@ -90,30 +94,40 @@ export class CodexActivityWriter {
         content: [
           {
             type: "toolCall",
-            name: "Bash",
+            name: toolName,
             id: toolCallId,
-            arguments: { command },
+            arguments: { ...args },
           },
         ],
       },
     });
   }
 
-  processToolResult(toolCallId: string, aggregatedOutput: string, exitCode: number | null): void {
-    const command = this.toolMap.get(toolCallId) ?? "";
-    const content: Array<{ type: "text"; text: string }> = [];
-    if (command) content.push({ type: "text", text: `$ ${command}` });
-    if (typeof exitCode === "number") content.push({ type: "text", text: `exit_code: ${exitCode}` });
-    const output = cleanText(aggregatedOutput);
-    if (output) content.push({ type: "text", text: output });
+  updateToolArguments(toolCallId: string, toolName: string, args: Record<string, unknown>): void {
+    this.toolMap.set(toolCallId, {
+      name: toolName,
+      arguments: { ...args },
+    });
+  }
+
+  processToolResult(toolCallId: string, toolName: string, result: GsdToolResultPayload): void {
+    const stored = this.toolMap.get(toolCallId);
+    const content = result.content
+      .map((part) => {
+        if (part && typeof part === "object" && part.type === "text" && typeof part.text === "string") {
+          return { type: "text" as const, text: cleanText(part.text) };
+        }
+        return null;
+      })
+      .filter((part): part is { type: "text"; text: string } => Boolean(part && part.text.length > 0));
 
     this.entries.push({
       type: "message",
       message: {
         role: "toolResult",
         toolCallId,
-        toolName: "Bash",
-        isError: typeof exitCode === "number" ? exitCode !== 0 : false,
+        toolName: stored?.name ?? toolName,
+        isError: result.isError === true,
         content,
       },
     });
@@ -151,4 +165,3 @@ export class CodexActivityWriter {
     }
   }
 }
-

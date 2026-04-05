@@ -12,6 +12,22 @@ import { z } from "zod";
 import type { ZodRawShape, ZodTypeAny } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
+export interface CodexBridgeToolStartEvent {
+  requestId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+}
+
+export interface CodexBridgeToolResultEvent {
+  requestId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  result: {
+    content: Array<{ type: "text"; text: string }>;
+    isError?: boolean;
+  };
+}
+
 function normalizeMcpResult(raw: unknown): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
   if (raw && typeof raw === "object") {
     const obj = raw as Record<string, unknown>;
@@ -190,6 +206,8 @@ export interface CodexToolBridge {
 
 export interface CodexToolBridgeOptions {
   shouldBlockContextWrite?: (toolName: string, args: Record<string, unknown>) => string | null;
+  onToolStart?: (event: CodexBridgeToolStartEvent) => void;
+  onToolResult?: (event: CodexBridgeToolResultEvent) => void;
 }
 
 export async function startCodexToolBridge(
@@ -208,6 +226,7 @@ export async function startCodexToolBridge(
 
   const app = createMcpExpressApp({ host: "127.0.0.1" });
   const activeClosers = new Set<() => Promise<void>>();
+  let requestSequence = 0;
 
   const createServer = () => {
     const server = new Server(
@@ -227,6 +246,7 @@ export async function startCodexToolBridge(
       const req = request as { params?: { name?: unknown; arguments?: unknown } };
       const name = typeof req?.params?.name === "string" ? req.params.name : "";
       const args = isRecord(req?.params?.arguments) ? req.params.arguments : {};
+      const requestId = `bridge_${(++requestSequence).toString(36)}`;
 
       const tool = gsdTools.find((candidate) => candidate.name === name);
       if (!tool) {
@@ -236,20 +256,50 @@ export async function startCodexToolBridge(
         };
       }
 
+      options.onToolStart?.({
+        requestId,
+        toolName: name,
+        args,
+      });
+
       const blockedReason = options.shouldBlockContextWrite?.(name, args);
       if (blockedReason) {
-        return {
-          isError: true,
+        const blockedResult = {
           content: [{ type: "text" as const, text: blockedReason }],
+          isError: true,
+        };
+        options.onToolResult?.({
+          requestId,
+          toolName: name,
+          args,
+          result: blockedResult,
+        });
+        return {
+          isError: blockedResult.isError,
+          content: blockedResult.content,
         };
       }
 
       try {
         const raw = await tool.execute(args, undefined);
-        return normalizeMcpResult(raw);
+        const result = normalizeMcpResult(raw);
+        options.onToolResult?.({
+          requestId,
+          toolName: name,
+          args,
+          result,
+        });
+        return result;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        return { isError: true, content: [{ type: "text" as const, text: message }] };
+        const result = { isError: true, content: [{ type: "text" as const, text: message }] };
+        options.onToolResult?.({
+          requestId,
+          toolName: name,
+          args,
+          result,
+        });
+        return result;
       }
     });
 

@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { registerProviderInfo } from "@thereaperjay/gsd-provider-api";
 import { CodexActivityWriter } from "./activity-writer.ts";
 import { startCodexToolBridge } from "./mcp-http-tools.ts";
+import type { CodexBridgeToolResultEvent, CodexBridgeToolStartEvent } from "./mcp-http-tools.ts";
 import type {
   GsdProviderInfo,
   GsdModel,
@@ -256,7 +257,7 @@ function isToolLikeItem(item: Record<string, unknown>): boolean {
   if (!itemType) return false;
   if (itemType === "agent_message" || itemType === "error" || itemType === "command_execution") return false;
   if (itemType.includes("reason") || itemType.includes("thinking")) return false;
-  if (itemType === "file_change") return false;
+  if (itemType === "file_change" || itemType === "mcp_tool_call") return false;
 
   const command = asString(item.command).trim();
   if (command.length > 0) return true;
@@ -410,6 +411,129 @@ function extractWriteTargetFromToolArgs(args: Record<string, unknown>): string |
   return null;
 }
 
+function extractStringArg(args: Record<string, unknown>, keys: readonly string[]): string {
+  for (const key of keys) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim().length > 0) return value;
+  }
+  return "";
+}
+
+function isCoalescableMcpTool(toolName: string, args: Record<string, unknown>): boolean {
+  const normalized = toolName.trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized === "write" || normalized === "apply_patch" || normalized === "edit") {
+    return extractWriteTargetFromToolArgs(args) !== null;
+  }
+  return false;
+}
+
+function buildMcpToolFingerprint(toolName: string, args: Record<string, unknown>, requestId: string): string {
+  const normalizedName = toolName.trim().toLowerCase() || "mcp";
+  const target = extractWriteTargetFromToolArgs(args);
+  if (target && isCoalescableMcpTool(toolName, args)) {
+    return `${normalizedName}::${target}`;
+  }
+  return `${normalizedName}::${requestId}`;
+}
+
+function buildMcpToolDetail(toolName: string, args: Record<string, unknown>): string | undefined {
+  const target = extractWriteTargetFromToolArgs(args);
+  if (target) return trimDetail(target, 140);
+
+  const toolSpecific = extractStringArg(args, ["query", "url", "name"]);
+  if (toolSpecific) return trimDetail(toolSpecific, 140);
+
+  const normalized = toolName.trim().toLowerCase();
+  if (normalized === "apply_patch") return "patch";
+  return undefined;
+}
+
+function buildMcpPreviewText(toolName: string, args: Record<string, unknown>): string {
+  const normalized = toolName.trim().toLowerCase();
+  const preview = extractStringArg(args, [
+    "content",
+    "patch",
+    "diff",
+    "replacement",
+    "text",
+    "body",
+    "input",
+  ]);
+  if (preview) return preview;
+  if (normalized === "write" || normalized === "apply_patch" || normalized === "edit") {
+    const target = extractWriteTargetFromToolArgs(args);
+    if (target) return target;
+  }
+  return "";
+}
+
+function buildMcpToolResult(
+  toolName: string,
+  args: Record<string, unknown>,
+  event: CodexBridgeToolResultEvent,
+): GsdToolResultPayload {
+  const content = event.result.content
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .filter((text) => text.trim().length > 0);
+
+  if (content.length === 0) {
+    const preview = buildMcpPreviewText(toolName, args);
+    if (preview.length > 0) content.push(preview);
+  }
+
+  return {
+    content: content.map((text) => ({ type: "text" as const, text })),
+    isError: event.result.isError === true,
+    details: {
+      tool: toolName,
+      targetPath: extractWriteTargetFromToolArgs(args) ?? undefined,
+    },
+  };
+}
+
+function updateAppendOnlyPreview(
+  session: ActiveMcpToolSession,
+  nextPreview: string,
+  queue: EventQueue,
+): void {
+  if (!nextPreview) return;
+  if (!session.previewStreamingEnabled) {
+    session.lastPreviewText = nextPreview;
+    return;
+  }
+
+  if (!session.lastPreviewText) {
+    session.lastPreviewText = nextPreview;
+    queue.push({ type: "tool_call_delta", toolCallId: session.toolCallId, delta: nextPreview });
+    return;
+  }
+
+  if (!nextPreview.startsWith(session.lastPreviewText)) {
+    session.previewStreamingEnabled = false;
+    session.lastPreviewText = nextPreview;
+    return;
+  }
+
+  const suffix = nextPreview.slice(session.lastPreviewText.length);
+  session.lastPreviewText = nextPreview;
+  if (suffix.length > 0) {
+    queue.push({ type: "tool_call_delta", toolCallId: session.toolCallId, delta: suffix });
+  }
+}
+
+interface ActiveMcpToolSession {
+  toolCallId: string;
+  fingerprint: string;
+  toolName: string;
+  detail?: string;
+  latestArgs: Record<string, unknown>;
+  latestResult: GsdToolResultPayload | null;
+  lastPreviewText: string;
+  previewStreamingEnabled: boolean;
+  keepOpenAcrossCalls: boolean;
+}
+
 function resolveActivityDir(basePath: string): string {
   let dir = basePath;
   while (dir !== "/") {
@@ -457,6 +581,8 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
     let pendingAgentMessage: string | null = null;
 
     const activeToolCalls = new Set<string>();
+    let activeMcpSession: ActiveMcpToolSession | null = null;
+    let visibleMcpToolSequence = 0;
 
     let softHandle: ReturnType<typeof setTimeout> | null = null;
     let idleHandle: ReturnType<typeof setInterval> | null = null;
@@ -475,7 +601,31 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       killEscalationHandle = null;
     }
 
+    function finalizeActiveMcpSession(): void {
+      const session = activeMcpSession;
+      if (!session) return;
+      activeMcpSession = null;
+
+      if (activeToolCalls.has(session.toolCallId)) {
+        activeToolCalls.delete(session.toolCallId);
+        deps.onToolEnd(session.toolCallId);
+      }
+
+      activityWriter.updateToolArguments(session.toolCallId, session.toolName, session.latestArgs);
+      queue.push({ type: "tool_call_end", toolCallId: session.toolCallId });
+      if (session.latestResult) {
+        activityWriter.processToolResult(session.toolCallId, session.toolName, session.latestResult);
+        queue.push({
+          type: "tool_result",
+          toolCallId: session.toolCallId,
+          toolName: session.toolName,
+          result: session.latestResult,
+        });
+      }
+    }
+
     function closeOutstandingTools(): void {
+      finalizeActiveMcpSession();
       for (const toolCallId of activeToolCalls) {
         deps.onToolEnd(toolCallId);
         queue.push({ type: "tool_call_end", toolCallId });
@@ -536,10 +686,11 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
         }
       }
 
+      finalizeActiveMcpSession();
       activeToolCalls.add(toolCallId);
       flushPendingAgentMessage(false);
       deps.onToolStart(toolCallId);
-      activityWriter.processToolStart(toolCallId, command);
+      activityWriter.processToolStart(toolCallId, "Bash", { command });
       queue.push({
         type: "tool_call_start",
         toolCallId,
@@ -557,6 +708,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       const toolCallId = makeToolCallId(asString(item.id));
       if (activeToolCalls.has(toolCallId)) return;
 
+      finalizeActiveMcpSession();
       activeToolCalls.add(toolCallId);
       flushPendingAgentMessage(false);
       deps.onToolStart(toolCallId);
@@ -593,14 +745,83 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
       if (activeToolCalls.has(toolCallId)) {
         activeToolCalls.delete(toolCallId);
         deps.onToolEnd(toolCallId);
-        activityWriter.processToolResult(toolCallId, aggregatedOutput, exitCode);
+        const result = buildCommandToolResult(aggregatedOutput, exitCode);
+        activityWriter.processToolResult(toolCallId, "Bash", result);
         queue.push({ type: "tool_call_end", toolCallId });
         queue.push({
           type: "tool_result",
           toolCallId,
           toolName: "Bash",
-          result: buildCommandToolResult(aggregatedOutput, exitCode),
+          result,
         });
+      }
+    }
+
+    function handleBridgeToolStart(event: CodexBridgeToolStartEvent): void {
+      const toolName = event.toolName.trim() || "tool";
+      const latestArgs = { ...event.args };
+      const fingerprint = buildMcpToolFingerprint(toolName, latestArgs, event.requestId);
+      const detail = buildMcpToolDetail(toolName, latestArgs);
+      const keepOpenAcrossCalls = isCoalescableMcpTool(toolName, latestArgs);
+
+      if (!activeMcpSession || activeMcpSession.fingerprint !== fingerprint || activeMcpSession.toolName !== toolName) {
+        finalizeActiveMcpSession();
+        flushPendingAgentMessage(false);
+
+        const toolCallId = `codex_mcp_${(++visibleMcpToolSequence).toString(36)}`;
+        activeMcpSession = {
+          toolCallId,
+          fingerprint,
+          toolName,
+          detail,
+          latestArgs,
+          latestResult: null,
+          lastPreviewText: "",
+          previewStreamingEnabled: true,
+          keepOpenAcrossCalls,
+        };
+        activeToolCalls.add(toolCallId);
+        deps.onToolStart(toolCallId);
+        activityWriter.processToolStart(toolCallId, toolName, latestArgs);
+        queue.push({
+          type: "tool_call_start",
+          toolCallId,
+          toolName,
+          detail,
+        });
+      } else {
+        activeMcpSession.detail = detail ?? activeMcpSession.detail;
+        activeMcpSession.latestArgs = latestArgs;
+        activeMcpSession.keepOpenAcrossCalls = keepOpenAcrossCalls;
+        activeMcpSession.latestResult = null;
+        activityWriter.updateToolArguments(activeMcpSession.toolCallId, toolName, latestArgs);
+      }
+
+      updateAppendOnlyPreview(activeMcpSession, buildMcpPreviewText(toolName, latestArgs), queue);
+    }
+
+    function handleBridgeToolResult(event: CodexBridgeToolResultEvent): void {
+      const toolName = event.toolName.trim() || "tool";
+      const latestArgs = { ...event.args };
+      const fingerprint = buildMcpToolFingerprint(toolName, latestArgs, event.requestId);
+
+      if (!activeMcpSession || activeMcpSession.fingerprint !== fingerprint || activeMcpSession.toolName !== toolName) {
+        handleBridgeToolStart({
+          requestId: event.requestId,
+          toolName,
+          args: latestArgs,
+        });
+      }
+      if (!activeMcpSession) return;
+
+      activeMcpSession.latestArgs = latestArgs;
+      activityWriter.updateToolArguments(activeMcpSession.toolCallId, toolName, latestArgs);
+      updateAppendOnlyPreview(activeMcpSession, buildMcpPreviewText(toolName, latestArgs), queue);
+
+      const result = buildMcpToolResult(toolName, latestArgs, event);
+      activeMcpSession.latestResult = result;
+      if (!activeMcpSession.keepOpenAcrossCalls || result.isError === true) {
+        finalizeActiveMcpSession();
       }
     }
 
@@ -635,6 +856,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
     function pushThinkingText(text: string): void {
       const normalized = text.trim();
       if (!normalized) return;
+      finalizeActiveMcpSession();
       const chunk = normalized.endsWith("\n") ? normalized : `${normalized}\n`;
       queue.push({ type: "thinking_delta", thinking: chunk });
       queue.push({ type: "thinking_end" });
@@ -650,6 +872,7 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
     }
 
     function onAgentMessage(text: string): void {
+      finalizeActiveMcpSession();
       if (pendingAgentMessage) {
         const interim = pendingAgentMessage.trim();
         if (interim.length > 0) {
@@ -668,7 +891,14 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
         const item = toRecord(event.item);
         const itemType = asString(item.type);
         if (itemType === "command_execution") startToolCall(item);
+        else if (itemType === "mcp_tool_call") return;
         else startGenericToolCall(item);
+        return;
+      }
+
+      if (type === "item.updated") {
+        const item = toRecord(event.item);
+        if (asString(item.type) === "mcp_tool_call") return;
         return;
       }
 
@@ -689,6 +919,10 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
             activityWriter.processAssistantText(text);
             onAgentMessage(text);
           }
+          return;
+        }
+
+        if (itemType === "mcp_tool_call") {
           return;
         }
 
@@ -769,6 +1003,8 @@ function codexCliCreateStream(context: GsdStreamContext, deps: GsdProviderDeps):
           );
           return result.block ? (result.reason ?? `Blocked protected write target: ${inputPath}`) : null;
         },
+        onToolStart: handleBridgeToolStart,
+        onToolResult: handleBridgeToolResult,
       });
       if (bridge) {
         toolBridge = bridge;
